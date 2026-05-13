@@ -26,6 +26,14 @@
 // All open tabs — populated by fetchOpenTabs()
 let openTabs = [];
 
+// Current search keyword. Always stored lowercased + trimmed.
+// '' means "no filter active".
+let searchQuery = '';
+
+// Whether setupTabSearch() has already wired up listeners.
+// Prevents rebinding on every renderDashboard() invocation.
+let tabSearchInitialized = false;
+
 /**
  * fetchOpenTabs()
  *
@@ -468,6 +476,57 @@ function checkAndShowEmptyState() {
 
   const countEl = document.getElementById('openTabsSectionCount');
   if (countEl) countEl.textContent = '0 domains';
+}
+
+/**
+ * matchTabBySearch(tab, query)
+ *
+ * 判断单个 chrome.tabs.Tab 是否命中搜索关键字。
+ * 匹配字段：tab.title + tab.url，规则为大小写不敏感的子串包含。
+ *
+ * @author Alfie
+ * @param {chrome.tabs.Tab} tab    待匹配的标签对象
+ * @param {string}          query  已 trim + toLowerCase 的关键字（调用方保证）
+ * @returns {boolean} 命中返回 true；query 为空字符串时调用方应跳过过滤
+ */
+function matchTabBySearch(tab, query) {
+  if (!query) return true;
+  const title = (tab.title || '').toLowerCase();
+  const url   = (tab.url   || '').toLowerCase();
+  return title.includes(query) || url.includes(query);
+}
+
+/**
+ * escapeHtml(str)
+ *
+ * 将字符串中的 HTML 特殊字符转义为实体，避免在 innerHTML 写入用户输入时
+ * 触发 XSS。仅供本文件内部使用。
+ *
+ * @author Alfie
+ * @param {string} str  任意字符串（如用户输入的搜索关键字）
+ * @returns {string} 转义后的安全字符串
+ */
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * getSearchEmptyStateHTML(rawQuery)
+ *
+ * 生成"搜索无命中"占位 HTML，用于写入 #openTabsMissions。
+ * rawQuery 原样展示给用户，需走 escapeHtml 防 XSS。
+ *
+ * @author Alfie
+ * @param {string} rawQuery  用户输入框中的原始关键字（未 toLowerCase）
+ * @returns {string} HTML 字符串
+ */
+function getSearchEmptyStateHTML(rawQuery) {
+  return `<div class="missions-search-empty">No tabs match <strong>&quot;${escapeHtml(rawQuery)}&quot;</strong></div>`;
 }
 
 /**
@@ -1028,7 +1087,16 @@ async function renderStaticDashboard() {
 
   // --- Fetch tabs ---
   await fetchOpenTabs();
-  const realTabs = getRealTabs();
+  let realTabs = getRealTabs();
+
+  // --- Apply search filter (case-insensitive substring on title + url).
+  //     If searchQuery is empty, skip filtering. We record the pre-filter
+  //     count so the empty-state branch below can distinguish
+  //     "no tabs at all" from "tabs exist but none match". ---
+  const totalBeforeFilter = realTabs.length;
+  if (searchQuery) {
+    realTabs = realTabs.filter(t => matchTabBySearch(t, searchQuery));
+  }
 
   // --- Group tabs by domain ---
   // Landing pages (Gmail inbox, Twitter home, etc.) get their own special group
@@ -1148,10 +1216,22 @@ async function renderStaticDashboard() {
   const openTabsSectionCount = document.getElementById('openTabsSectionCount');
   const openTabsSectionTitle = document.getElementById('openTabsSectionTitle');
 
+  // 是否处于"有标签但被搜索过滤掉全部"的状态
+  const searchYieldedEmpty =
+    searchQuery !== '' && totalBeforeFilter > 0 && domainGroups.length === 0;
+
   if (domainGroups.length > 0 && openTabsSection) {
     if (openTabsSectionTitle) openTabsSectionTitle.textContent = 'Open tabs';
     openTabsSectionCount.innerHTML = `${domainGroups.length} domain${domainGroups.length !== 1 ? 's' : ''} &nbsp;&middot;&nbsp; <button class="action-btn close-tabs" data-action="close-all-open-tabs" style="font-size:11px;padding:3px 10px;">${ICONS.close} Close all ${realTabs.length} tabs</button>`;
     openTabsMissionsEl.innerHTML = domainGroups.map(g => renderDomainCard(g)).join('');
+    openTabsSection.style.display = 'block';
+  } else if (searchYieldedEmpty && openTabsSection) {
+    // 搜索零命中：保持 section 可见，渲染空状态文案
+    if (openTabsSectionTitle) openTabsSectionTitle.textContent = 'Open tabs';
+    openTabsSectionCount.innerHTML = '';
+    openTabsMissionsEl.innerHTML = getSearchEmptyStateHTML(
+      document.getElementById('tabSearchInput')?.value ?? searchQuery
+    );
     openTabsSection.style.display = 'block';
   } else if (openTabsSection) {
     openTabsSection.style.display = 'none';
@@ -1168,8 +1248,111 @@ async function renderStaticDashboard() {
   await renderDeferredColumn();
 }
 
+/**
+ * setupTabSearch()
+ *
+ * 一次性绑定搜索相关的事件：
+ *   1. #tabSearchInput 的 input 事件（120ms debounce → 更新 searchQuery + 重渲染）
+ *   2. #tabSearchClear 的 click 事件（立即清空 + 重渲染 + 保持聚焦）
+ *   3. 全局 keydown：
+ *        - "/" 或 Cmd/Ctrl+K 在非输入元素聚焦时 → 聚焦搜索框（preventDefault）
+ *        - Esc 在搜索框聚焦时 → 清空 + 失焦 + 重渲染
+ *
+ * 只在首次 renderDashboard 后调用一次；之后的重渲染不会重建 input 节点。
+ *
+ * @author Alfie
+ * @returns {void}
+ */
+function setupTabSearch() {
+  const input = document.getElementById('tabSearchInput');
+  const clearBtn = document.getElementById('tabSearchClear');
+  if (!input || !clearBtn) return;
+
+  /** 防抖计时器句柄，每次 input 事件 reset。 */
+  let debounceTimer = null;
+  const DEBOUNCE_MS = 120;
+
+  /**
+   * 同步 clear 按钮显隐，仅依据 input.value 是否非空。
+   * @returns {void}
+   */
+  function syncClearButtonVisibility() {
+    clearBtn.style.display = input.value.length > 0 ? 'inline-flex' : 'none';
+  }
+
+  /**
+   * 提交当前输入：写入 searchQuery 并触发重渲染。
+   * 调用方负责决定是否经过 debounce。
+   * @returns {void}
+   */
+  function commitQueryFromInput() {
+    searchQuery = input.value.trim().toLowerCase();
+    renderStaticDashboard();
+  }
+
+  input.addEventListener('input', () => {
+    syncClearButtonVisibility();
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(commitQueryFromInput, DEBOUNCE_MS);
+  });
+
+  clearBtn.addEventListener('click', () => {
+    if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+    input.value = '';
+    syncClearButtonVisibility();
+    searchQuery = '';
+    renderStaticDashboard();
+    input.focus();
+  });
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+      input.value = '';
+      syncClearButtonVisibility();
+      searchQuery = '';
+      renderStaticDashboard();
+      input.blur();
+    }
+  });
+
+  /**
+   * 判断当前焦点是否处于可输入元素，用以决定是否拦截全局快捷键。
+   * @returns {boolean}
+   */
+  function isTypingElsewhere() {
+    const ae = document.activeElement;
+    if (!ae) return false;
+    if (ae === input) return true;
+    const tag = ae.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (ae.isContentEditable) return true;
+    return false;
+  }
+
+  document.addEventListener('keydown', (e) => {
+    // "/" 单键聚焦：仅在没有任何输入元素聚焦时生效
+    if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey && !isTypingElsewhere()) {
+      e.preventDefault();
+      input.focus();
+      input.select();
+      return;
+    }
+    // Cmd/Ctrl + K 聚焦：全局拦截
+    if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+      e.preventDefault();
+      input.focus();
+      input.select();
+    }
+  });
+
+  tabSearchInitialized = true;
+}
+
 async function renderDashboard() {
   await renderStaticDashboard();
+  if (!tabSearchInitialized) setupTabSearch();
 }
 
 
